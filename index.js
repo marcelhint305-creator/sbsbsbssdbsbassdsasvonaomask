@@ -83,9 +83,12 @@ const PASARAN = {
   "p30104": "HAITI"
 };
 
+// 🔥 Daftar kode Toto Macau
+const KODE_MACAU = ["m17", "m51"];
+
 let cache = {};
 
-// 🔄 SCRAPE FINAL dengan timeout
+// 🔄 SCRAPE FINAL dengan timeout dan pengecekan tanggal yang akurat
 async function scrape(kode) {
   try {
     const url = `https://kartuhappy.com/history/result/${kode}/kosong`;
@@ -99,7 +102,17 @@ async function scrape(kode) {
     });
     
     const $ = cheerio.load(data);
-    const todayStr = new Date().toISOString().split("T")[0];
+    
+    // 🔥 Dapatkan tanggal hari ini dalam format YYYY-MM-DD
+    const now = new Date();
+    const todayStr = now.toISOString().split("T")[0]; // Format: 2026-09-05
+    
+    // 🔥 Waktu sekarang dalam WIB
+    const nowWIB = new Date(now.getTime() + (7 * 60 * 60 * 1000));
+    const currentHour = nowWIB.getHours();
+    const currentMinute = nowWIB.getMinutes();
+    const currentTimeInMinutes = currentHour * 60 + currentMinute;
+    
     let found = null;
 
     $("table tbody tr").each((i, el) => {
@@ -117,41 +130,42 @@ async function scrape(kode) {
 
       if (!tanggalText || !angka) return;
 
+      // 🔥 Split tanggal dan jam dari format "YYYY-MM-DD|HH:MM"
       let [tanggal, jam] = tanggalText.split("|").map(x => x.trim());
       if (!tanggal) return;
 
+      // 🔥 Pengecekan yang lebih akurat: bandingkan tanggal saja (tanpa waktu)
       if (tanggal === todayStr) {
         found = { tanggal, jam, angka };
-        return false;
+        return false; // Break loop setelah menemukan data hari ini
       }
     });
 
+    // 🔥 Jika tidak ditemukan data untuk tanggal hari ini
     if (!found) {
       cache[kode] = {
         kode,
         pasaran: PASARAN[kode],
-        angka: "",
-        tanggal: null,
-        jam: null,
-        status: "MENUNGGU",
-        waktuLalu: "-",
+        status: "BELUM",
+        pesan: "Data untuk tanggal hari ini belum tersedia",
+        tanggalHariIni: todayStr,
         updated: new Date()
       };
+      console.log(`⏳ ${kode} (${PASARAN[kode]}): BELUM ada data untuk ${todayStr}`);
       return;
     }
 
+    // 🔥 Jika ditemukan data untuk tanggal hari ini
     const { tanggal, jam, angka } = found;
-    const now = new Date();
-    const nowWIB = new Date(now.getTime() + (7 * 60 * 60 * 1000));
-
+    
     let waktuLalu = "-";
     let diffMinutes = 0;
+    let isMacauBelumNaik = false;
 
     if (jam) {
       const [h, m] = jam.split(":").map(Number);
       const resultMinutes = h * 60 + m;
-      const nowMinutes = nowWIB.getHours() * 60 + nowWIB.getMinutes();
-      diffMinutes = nowMinutes - resultMinutes;
+      diffMinutes = currentTimeInMinutes - resultMinutes;
       if (diffMinutes < 0) diffMinutes += 1440;
 
       if (diffMinutes < 1) {
@@ -165,6 +179,26 @@ async function scrape(kode) {
           ? `${jamnya} jam lalu`
           : `${jamnya} jam ${sisamenit} menit lalu`;
       }
+
+      // 🔥 KHUSUS MACAU: Cek apakah sudah lebih dari 2 jam (120 menit)
+      if (KODE_MACAU.includes(kode)) {
+        if (diffMinutes > 120) {
+          isMacauBelumNaik = true;
+        }
+      }
+    }
+
+    // 🔥 Tentukan status berdasarkan kondisi
+    let status, pesan;
+    
+    if (isMacauBelumNaik) {
+      // Khusus Macau: data ada tapi sudah lebih dari 2 jam
+      status = "BELUM_NAIK";
+      pesan = `Data ada sejak jam ${jam}, tapi sudah lebih dari 2 jam (${waktuLalu}). Menunggu angka baru.`;
+    } else {
+      // Normal: data sudah tersedia
+      status = "SUDAH";
+      pesan = `Data sudah tersedia sejak jam ${jam}`;
     }
 
     const newData = {
@@ -173,22 +207,38 @@ async function scrape(kode) {
       angka,
       tanggal,
       jam,
-      status: "SUDAH",
+      status,
+      pesan,
       selisihMenit: diffMinutes,
       waktuLalu,
+      isMacauBelumNaik, // Flag khusus untuk Macau
       updated: new Date()
     };
 
     const old = cache[kode];
     cache[kode] = newData;
 
-    if (!old || old.angka !== newData.angka) {
+    // 🔥 Emit update jika ada perubahan angka atau status baru
+    if (!old || old.angka !== newData.angka || old.status !== newData.status) {
       io.emit("update", newData);
-      console.log("🔥 UPDATE:", kode, angka);
+      
+      if (isMacauBelumNaik) {
+        console.log(`⚠️ ${kode} (${PASARAN[kode]}): BELUM_NAIK - Angka: ${angka}, Jam: ${jam}, Selisih: ${diffMinutes} menit (${waktuLalu})`);
+      } else {
+        console.log(`✅ ${kode} (${PASARAN[kode]}): SUDAH - Angka: ${angka}, Jam: ${jam}, Waktu: ${waktuLalu}`);
+      }
     }
 
   } catch (err) {
     console.error(`❌ Error scraping ${kode}:`, err.message);
+    // 🔥 Tetap update cache dengan status error
+    cache[kode] = {
+      kode,
+      pasaran: PASARAN[kode],
+      status: "ERROR",
+      pesan: `Gagal mengambil data: ${err.message}`,
+      updated: new Date()
+    };
   }
 }
 
@@ -224,14 +274,20 @@ app.get("/api", (req, res) => {
     });
   }
   
-  res.json(cache[kode] || { error: "Kode tidak ditemukan", kode });
+  res.json(cache[kode] || { 
+    error: "Kode tidak ditemukan", 
+    kode,
+    status: "BELUM_DICEK",
+    pesan: "Data belum pernah dicek"
+  });
 });
 
 // 🔥 Endpoint untuk list semua pasaran
 app.get("/api/pasaran", (req, res) => {
   res.json({
     total: Object.keys(PASARAN).length,
-    pasaran: PASARAN
+    pasaran: PASARAN,
+    macauCodes: KODE_MACAU
   });
 });
 
@@ -289,6 +345,7 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log("📍 Test API: http://localhost:" + PORT + "/api?kode=m17");
   console.log("📍 Health check: http://localhost:" + PORT + "/health");
   console.log("📊 Total pasaran:", Object.keys(PASARAN).length);
+  console.log("🎯 Kode Macau:", KODE_MACAU.join(", "));
 });
 
 // 🔥 Graceful shutdown untuk Railway
