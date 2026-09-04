@@ -8,7 +8,7 @@ const { Server } = require("socket.io");
 const app = express();
 app.use(cors());
 
-// 🔥 LOGGING MIDDLEWARE (untuk debugging Railway)
+// 🔥 LOGGING MIDDLEWARE
 app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
   next();
@@ -88,12 +88,11 @@ const KODE_MACAU = ["m17", "m51"];
 
 let cache = {};
 
-// 🔄 SCRAPE FINAL dengan timeout dan pengecekan tanggal yang akurat
+// 🔄 SCRAPE FINAL dengan Logika Khusus Macau 1.5 Jam
 async function scrape(kode) {
   try {
     const url = `https://kartuhappy.com/history/result/${kode}/kosong`;
     
-    // 🔥 Tambahkan timeout untuk mencegah hanging
     const { data } = await axios.get(url, { 
       timeout: 5000,
       headers: {
@@ -103,16 +102,15 @@ async function scrape(kode) {
     
     const $ = cheerio.load(data);
     
-    // 🔥 Dapatkan tanggal hari ini dalam format YYYY-MM-DD
+    // 🔥 Waktu Sekarang (Server Time / UTC)
     const now = new Date();
-    const todayStr = now.toISOString().split("T")[0]; // Format: 2026-09-05
+    const todayStr = now.toISOString().split("T")[0]; // Format YYYY-MM-DD
     
-    // 🔥 Waktu sekarang dalam WIB
-    const nowWIB = new Date(now.getTime() + (7 * 60 * 60 * 1000));
-    const currentHour = nowWIB.getHours();
-    const currentMinute = nowWIB.getMinutes();
-    const currentTimeInMinutes = currentHour * 60 + currentMinute;
-    
+    // Hitung total menit sekarang untuk perbandingan
+    const currentHour = now.getUTCHours();
+    const currentMinute = now.getUTCMinutes();
+    const currentTimeInMinutes = (currentHour * 60) + currentMinute;
+
     let found = null;
 
     $("table tbody tr").each((i, el) => {
@@ -130,108 +128,89 @@ async function scrape(kode) {
 
       if (!tanggalText || !angka) return;
 
-      // 🔥 Split tanggal dan jam dari format "YYYY-MM-DD|HH:MM"
+      // Split tanggal dan jam
       let [tanggal, jam] = tanggalText.split("|").map(x => x.trim());
-      if (!tanggal) return;
+      
+      if (!tanggal || tanggal.length !== 10) return;
 
-      // 🔥 Pengecekan yang lebih akurat: bandingkan tanggal saja (tanpa waktu)
+      // 🔥 CEK 1: Apakah tanggalnya HARI INI?
       if (tanggal === todayStr) {
         found = { tanggal, jam, angka };
-        return false; // Break loop setelah menemukan data hari ini
+        return false; // Break loop
       }
     });
 
-    // 🔥 Jika tidak ditemukan data untuk tanggal hari ini
+    let status, pesan, newData;
+
     if (!found) {
-      cache[kode] = {
+      // Jika tidak ada data hari ini sama sekali
+      status = "BELUM";
+      pesan = `Data untuk tanggal ${todayStr} belum tersedia.`;
+      
+      newData = {
         kode,
         pasaran: PASARAN[kode],
-        status: "BELUM",
-        pesan: "Data untuk tanggal hari ini belum tersedia",
+        status,
+        pesan,
         tanggalHariIni: todayStr,
         updated: new Date()
       };
-      console.log(`⏳ ${kode} (${PASARAN[kode]}): BELUM ada data untuk ${todayStr}`);
-      return;
-    }
-
-    // 🔥 Jika ditemukan data untuk tanggal hari ini
-    const { tanggal, jam, angka } = found;
-    
-    let waktuLalu = "-";
-    let diffMinutes = 0;
-    let isMacauBelumNaik = false;
-
-    if (jam) {
-      const [h, m] = jam.split(":").map(Number);
-      const resultMinutes = h * 60 + m;
-      diffMinutes = currentTimeInMinutes - resultMinutes;
-      if (diffMinutes < 0) diffMinutes += 1440;
-
-      if (diffMinutes < 1) {
-        waktuLalu = "baru saja";
-      } else if (diffMinutes < 60) {
-        waktuLalu = `${diffMinutes} menit lalu`;
-      } else {
-        const jamnya = Math.floor(diffMinutes / 60);
-        const sisamenit = diffMinutes % 60;
-        waktuLalu = sisamenit === 0
-          ? `${jamnya} jam lalu`
-          : `${jamnya} jam ${sisamenit} menit lalu`;
-      }
-
-      // 🔥 KHUSUS MACAU: Cek apakah sudah lebih dari 2 jam (120 menit)
-      if (KODE_MACAU.includes(kode)) {
-        if (diffMinutes > 120) {
-          isMacauBelumNaik = true;
-        }
-      }
-    }
-
-    // 🔥 Tentukan status berdasarkan kondisi
-    let status, pesan;
-    
-    if (isMacauBelumNaik) {
-      // Khusus Macau: data ada tapi sudah lebih dari 2 jam
-      status = "BELUM_NAIK";
-      pesan = `Data ada sejak jam ${jam}, tapi sudah lebih dari 2 jam (${waktuLalu}). Menunggu angka baru.`;
+      
     } else {
-      // Normal: data sudah tersedia
+      // Ada data hari ini
+      const { tanggal, jam, angka } = found;
+      
+      // Default status SUDAH
       status = "SUDAH";
-      pesan = `Data sudah tersedia sejak jam ${jam}`;
-    }
+      pesan = `Result tanggal ${tanggal} jam ${jam} tersedia.`;
 
-    const newData = {
-      kode,
-      pasaran: PASARAN[kode],
-      angka,
-      tanggal,
-      jam,
-      status,
-      pesan,
-      selisihMenit: diffMinutes,
-      waktuLalu,
-      isMacauBelumNaik, // Flag khusus untuk Macau
-      updated: new Date()
-    };
+      // 🔥 CEK KHUSUS MACAU: Jika lebih dari 1.5 Jam (90 Menit), anggap BELUM
+      if (KODE_MACAU.includes(kode) && jam) {
+        const [h, m] = jam.split(":").map(Number);
+        const resultMinutes = (h * 60) + m;
+        
+        // Hitung selisih menit
+        let diffMinutes = currentTimeInMinutes - resultMinutes;
+        
+        // Handle pergantian hari (jika result malam, cek pagi hari berikutnya)
+        if (diffMinutes < 0) {
+            diffMinutes += 1440; 
+        }
+
+        // Jika selisih > 90 menit, paksa jadi BELUM
+        if (diffMinutes > 90) {
+          status = "BELUM";
+          pesan = `Data Macau terdeteksi lama (${diffMinutes} menit lalu). Dianggap belum naik untuk periode baru.`;
+          console.log(`⚠️ ${kode}: Data lama (${diffMinutes} menit), status dipaksa BELUM`);
+        } else {
+           console.log(`✅ ${kode}: Data fresh (${diffMinutes} menit lalu), status SUDAH`);
+        }
+      } else {
+         console.log(`✅ ${kode}: Data hari ini ditemukan, status SUDAH`);
+      }
+
+      newData = {
+        kode,
+        pasaran: PASARAN[kode],
+        angka,
+        tanggal,
+        jam,
+        status,
+        pesan,
+        updated: new Date()
+      };
+    }
 
     const old = cache[kode];
     cache[kode] = newData;
 
-    // 🔥 Emit update jika ada perubahan angka atau status baru
-    if (!old || old.angka !== newData.angka || old.status !== newData.status) {
+    // Emit update jika ada perubahan
+    if (!old || old.status !== newData.status || old.angka !== newData.angka) {
       io.emit("update", newData);
-      
-      if (isMacauBelumNaik) {
-        console.log(`⚠️ ${kode} (${PASARAN[kode]}): BELUM_NAIK - Angka: ${angka}, Jam: ${jam}, Selisih: ${diffMinutes} menit (${waktuLalu})`);
-      } else {
-        console.log(`✅ ${kode} (${PASARAN[kode]}): SUDAH - Angka: ${angka}, Jam: ${jam}, Waktu: ${waktuLalu}`);
-      }
     }
 
   } catch (err) {
     console.error(`❌ Error scraping ${kode}:`, err.message);
-    // 🔥 Tetap update cache dengan status error
     cache[kode] = {
       kode,
       pasaran: PASARAN[kode],
@@ -242,15 +221,13 @@ async function scrape(kode) {
   }
 }
 
-// 🔁 LOOP REALTIME - Interval lebih lama untuk Railway
+// 🔁 LOOP REALTIME
 setInterval(() => {
-  console.log("🔄 Starting scrape cycle...");
   Object.keys(PASARAN).forEach(scrape);
-}, 10000); // Ubah dari 2000 ke 10000 (10 detik) untuk mengurangi beban
+}, 10000); 
 
 // ==================== ROUTES ====================
 
-// 🔥 ROOT ROUTE - WAJIB ADA untuk Railway
 app.get("/", (req, res) => {
   res.json({
     status: "running",
@@ -262,105 +239,39 @@ app.get("/", (req, res) => {
   });
 });
 
-// 🔥 API ENDPOINTS
 app.get("/api", (req, res) => {
   const { kode } = req.query;
-  
   if (!kode) {
-    return res.json({
-      message: "Gunakan parameter ?kode=m17",
-      availableCodes: Object.keys(PASARAN).slice(0, 10),
-      totalCodes: Object.keys(PASARAN).length
-    });
+    return res.json({ message: "Gunakan parameter ?kode=m17" });
   }
-  
-  res.json(cache[kode] || { 
-    error: "Kode tidak ditemukan", 
-    kode,
-    status: "BELUM_DICEK",
-    pesan: "Data belum pernah dicek"
-  });
+  res.json(cache[kode] || { error: "Kode tidak ditemukan", status: "BELUM_DICEK" });
 });
 
-// 🔥 Endpoint untuk list semua pasaran
 app.get("/api/pasaran", (req, res) => {
-  res.json({
-    total: Object.keys(PASARAN).length,
-    pasaran: PASARAN,
-    macauCodes: KODE_MACAU
-  });
+  res.json({ total: Object.keys(PASARAN).length, pasaran: PASARAN, macauCodes: KODE_MACAU });
 });
 
-// 🔥 Endpoint untuk semua data cache
 app.get("/api/all", (req, res) => {
-  res.json({
-    total: Object.keys(cache).length,
-    data: cache
-  });
+  res.json({ total: Object.keys(cache).length, data: cache });
 });
 
-// 🔥 Health check endpoint (penting untuk Railway monitoring)
 app.get("/health", (req, res) => {
-  res.json({
-    status: "healthy",
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    cacheSize: Object.keys(cache).length,
-    timestamp: new Date().toISOString()
-  });
+  res.json({ status: "healthy", uptime: process.uptime() });
 });
 
 // SOCKET
 io.on("connection", (socket) => {
-  console.log("🔌 Client connected:", socket.id);
   socket.emit("init", cache);
-  
-  socket.on("disconnect", () => {
-    console.log("❌ Client disconnected:", socket.id);
-  });
+  socket.on("disconnect", () => {});
 });
 
-// 🔥 ERROR HANDLER 404
 app.use((req, res) => {
-  res.status(404).json({ 
-    error: "Route not found",
-    message: `Cannot ${req.method} ${req.url}`,
-    suggestion: "Try: GET /api?kode=m17"
-  });
+  res.status(404).json({ error: "Route not found" });
 });
 
-// 🔥 GLOBAL ERROR HANDLER
-app.use((err, req, res, next) => {
-  console.error("💥 Unhandled error:", err);
-  res.status(500).json({
-    error: "Internal server error",
-    message: process.env.NODE_ENV === 'production' ? 'Something went wrong' : err.message
-  });
-});
-
-// START SERVER
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("🚀 Backend realtime aktif di port", PORT);
-  console.log("📍 Test root: http://localhost:" + PORT + "/");
-  console.log("📍 Test API: http://localhost:" + PORT + "/api?kode=m17");
-  console.log("📍 Health check: http://localhost:" + PORT + "/health");
-  console.log("📊 Total pasaran:", Object.keys(PASARAN).length);
-  console.log("🎯 Kode Macau:", KODE_MACAU.join(", "));
+  console.log("🚀 Backend aktif di port", PORT);
 });
 
-// 🔥 Graceful shutdown untuk Railway
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received. Shutting down gracefully...');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
-});
-
-process.on('SIGINT', () => {
-  console.log('SIGINT received. Shutting down gracefully...');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
-});
+process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
+process.on('SIGINT', () => { server.close(() => process.exit(0)); });
