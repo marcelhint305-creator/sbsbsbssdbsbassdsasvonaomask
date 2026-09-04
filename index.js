@@ -8,7 +8,7 @@ const { Server } = require("socket.io");
 const app = express();
 app.use(cors());
 
-// 🔥 LOGGING MIDDLEWARE
+// 🔥 LOGGING MIDDLEWARE (untuk debugging Railway)
 app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
   next();
@@ -83,16 +83,14 @@ const PASARAN = {
   "p30104": "HAITI"
 };
 
-// 🔥 Daftar kode Toto Macau
-const KODE_MACAU = ["m17", "m51"];
-
 let cache = {};
 
-// 🔄 SCRAPE FINAL dengan Logika Khusus Macau 1.5 Jam
+// 🔄 SCRAPE FINAL dengan timeout
 async function scrape(kode) {
   try {
     const url = `https://kartuhappy.com/history/result/${kode}/kosong`;
     
+    // 🔥 Tambahkan timeout untuk mencegah hanging
     const { data } = await axios.get(url, { 
       timeout: 5000,
       headers: {
@@ -101,16 +99,7 @@ async function scrape(kode) {
     });
     
     const $ = cheerio.load(data);
-    
-    // 🔥 Waktu Sekarang (Server Time / UTC)
-    const now = new Date();
-    const todayStr = now.toISOString().split("T")[0]; // Format YYYY-MM-DD
-    
-    // Hitung total menit sekarang untuk perbandingan
-    const currentHour = now.getUTCHours();
-    const currentMinute = now.getUTCMinutes();
-    const currentTimeInMinutes = (currentHour * 60) + currentMinute;
-
+    const todayStr = new Date().toISOString().split("T")[0];
     let found = null;
 
     $("table tbody tr").each((i, el) => {
@@ -128,106 +117,90 @@ async function scrape(kode) {
 
       if (!tanggalText || !angka) return;
 
-      // Split tanggal dan jam
       let [tanggal, jam] = tanggalText.split("|").map(x => x.trim());
-      
-      if (!tanggal || tanggal.length !== 10) return;
+      if (!tanggal) return;
 
-      // 🔥 CEK 1: Apakah tanggalnya HARI INI?
       if (tanggal === todayStr) {
         found = { tanggal, jam, angka };
-        return false; // Break loop
+        return false;
       }
     });
 
-    let status, pesan, newData;
-
     if (!found) {
-      // Jika tidak ada data hari ini sama sekali
-      status = "BELUM";
-      pesan = `Data untuk tanggal ${todayStr} belum tersedia.`;
-      
-      newData = {
+      cache[kode] = {
         kode,
         pasaran: PASARAN[kode],
-        status,
-        pesan,
-        tanggalHariIni: todayStr,
+        angka: "",
+        tanggal: null,
+        jam: null,
+        status: "MENUNGGU",
+        waktuLalu: "-",
         updated: new Date()
       };
-      
-    } else {
-      // Ada data hari ini
-      const { tanggal, jam, angka } = found;
-      
-      // Default status SUDAH
-      status = "SUDAH";
-      pesan = `Result tanggal ${tanggal} jam ${jam} tersedia.`;
-
-      // 🔥 CEK KHUSUS MACAU: Jika lebih dari 1.5 Jam (90 Menit), anggap BELUM
-      if (KODE_MACAU.includes(kode) && jam) {
-        const [h, m] = jam.split(":").map(Number);
-        const resultMinutes = (h * 60) + m;
-        
-        // Hitung selisih menit
-        let diffMinutes = currentTimeInMinutes - resultMinutes;
-        
-        // Handle pergantian hari (jika result malam, cek pagi hari berikutnya)
-        if (diffMinutes < 0) {
-            diffMinutes += 1440; 
-        }
-
-        // Jika selisih > 90 menit, paksa jadi BELUM
-        if (diffMinutes > 90) {
-          status = "BELUM";
-          pesan = `Data Macau terdeteksi lama (${diffMinutes} menit lalu). Dianggap belum naik untuk periode baru.`;
-          console.log(`⚠️ ${kode}: Data lama (${diffMinutes} menit), status dipaksa BELUM`);
-        } else {
-           console.log(`✅ ${kode}: Data fresh (${diffMinutes} menit lalu), status SUDAH`);
-        }
-      } else {
-         console.log(`✅ ${kode}: Data hari ini ditemukan, status SUDAH`);
-      }
-
-      newData = {
-        kode,
-        pasaran: PASARAN[kode],
-        angka,
-        tanggal,
-        jam,
-        status,
-        pesan,
-        updated: new Date()
-      };
+      return;
     }
+
+    const { tanggal, jam, angka } = found;
+    const now = new Date();
+    const nowWIB = new Date(now.getTime() + (7 * 60 * 60 * 1000));
+
+    let waktuLalu = "-";
+    let diffMinutes = 0;
+
+    if (jam) {
+      const [h, m] = jam.split(":").map(Number);
+      const resultMinutes = h * 60 + m;
+      const nowMinutes = nowWIB.getHours() * 60 + nowWIB.getMinutes();
+      diffMinutes = nowMinutes - resultMinutes;
+      if (diffMinutes < 0) diffMinutes += 1440;
+
+      if (diffMinutes < 1) {
+        waktuLalu = "baru saja";
+      } else if (diffMinutes < 60) {
+        waktuLalu = `${diffMinutes} menit lalu`;
+      } else {
+        const jamnya = Math.floor(diffMinutes / 60);
+        const sisamenit = diffMinutes % 60;
+        waktuLalu = sisamenit === 0
+          ? `${jamnya} jam lalu`
+          : `${jamnya} jam ${sisamenit} menit lalu`;
+      }
+    }
+
+    const newData = {
+      kode,
+      pasaran: PASARAN[kode],
+      angka,
+      tanggal,
+      jam,
+      status: "SUDAH",
+      selisihMenit: diffMinutes,
+      waktuLalu,
+      updated: new Date()
+    };
 
     const old = cache[kode];
     cache[kode] = newData;
 
-    // Emit update jika ada perubahan
-    if (!old || old.status !== newData.status || old.angka !== newData.angka) {
+    if (!old || old.angka !== newData.angka) {
       io.emit("update", newData);
+      console.log("🔥 UPDATE:", kode, angka);
     }
 
   } catch (err) {
     console.error(`❌ Error scraping ${kode}:`, err.message);
-    cache[kode] = {
-      kode,
-      pasaran: PASARAN[kode],
-      status: "ERROR",
-      pesan: `Gagal mengambil data: ${err.message}`,
-      updated: new Date()
-    };
   }
 }
 
-// 🔁 LOOP REALTIME
+// 🔁 LOOP REALTIME - Interval lebih lama untuk Railway
 setInterval(() => {
+  console.log("🔄 Starting scrape cycle...");
   Object.keys(PASARAN).forEach(scrape);
-}, 10000); 
+}, 10000); // Ubah dari 2000 ke 10000 (10 detik) untuk mengurangi beban
 
 // ==================== ROUTES ====================
 
+// 🔥 ROOT ROUTE - WAJIB ADA untuk Railway
 app.get("/", (req, res) => {
   res.json({
     status: "running",
@@ -239,39 +212,98 @@ app.get("/", (req, res) => {
   });
 });
 
+// 🔥 API ENDPOINTS
 app.get("/api", (req, res) => {
   const { kode } = req.query;
+  
   if (!kode) {
-    return res.json({ message: "Gunakan parameter ?kode=m17" });
+    return res.json({
+      message: "Gunakan parameter ?kode=m17",
+      availableCodes: Object.keys(PASARAN).slice(0, 10),
+      totalCodes: Object.keys(PASARAN).length
+    });
   }
-  res.json(cache[kode] || { error: "Kode tidak ditemukan", status: "BELUM_DICEK" });
+  
+  res.json(cache[kode] || { error: "Kode tidak ditemukan", kode });
 });
 
+// 🔥 Endpoint untuk list semua pasaran
 app.get("/api/pasaran", (req, res) => {
-  res.json({ total: Object.keys(PASARAN).length, pasaran: PASARAN, macauCodes: KODE_MACAU });
+  res.json({
+    total: Object.keys(PASARAN).length,
+    pasaran: PASARAN
+  });
 });
 
+// 🔥 Endpoint untuk semua data cache
 app.get("/api/all", (req, res) => {
-  res.json({ total: Object.keys(cache).length, data: cache });
+  res.json({
+    total: Object.keys(cache).length,
+    data: cache
+  });
 });
 
+// 🔥 Health check endpoint (penting untuk Railway monitoring)
 app.get("/health", (req, res) => {
-  res.json({ status: "healthy", uptime: process.uptime() });
+  res.json({
+    status: "healthy",
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    cacheSize: Object.keys(cache).length,
+    timestamp: new Date().toISOString()
+  });
 });
 
 // SOCKET
 io.on("connection", (socket) => {
+  console.log("🔌 Client connected:", socket.id);
   socket.emit("init", cache);
-  socket.on("disconnect", () => {});
+  
+  socket.on("disconnect", () => {
+    console.log("❌ Client disconnected:", socket.id);
+  });
 });
 
+// 🔥 ERROR HANDLER 404
 app.use((req, res) => {
-  res.status(404).json({ error: "Route not found" });
+  res.status(404).json({ 
+    error: "Route not found",
+    message: `Cannot ${req.method} ${req.url}`,
+    suggestion: "Try: GET /api?kode=m17"
+  });
 });
 
+// 🔥 GLOBAL ERROR HANDLER
+app.use((err, req, res, next) => {
+  console.error("💥 Unhandled error:", err);
+  res.status(500).json({
+    error: "Internal server error",
+    message: process.env.NODE_ENV === 'production' ? 'Something went wrong' : err.message
+  });
+});
+
+// START SERVER
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("🚀 Backend aktif di port", PORT);
+  console.log("🚀 Backend realtime aktif di port", PORT);
+  console.log("📍 Test root: http://localhost:" + PORT + "/");
+  console.log("📍 Test API: http://localhost:" + PORT + "/api?kode=m17");
+  console.log("📍 Health check: http://localhost:" + PORT + "/health");
+  console.log("📊 Total pasaran:", Object.keys(PASARAN).length);
 });
 
-process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
-process.on('SIGINT', () => { server.close(() => process.exit(0)); });
+// 🔥 Graceful shutdown untuk Railway
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Shutting down gracefully...');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received. Shutting down gracefully...');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
